@@ -1,0 +1,78 @@
+use mongodb::bson::doc;
+use mongodb::options::{ClientOptions, ServerApi, ServerApiVersion};
+use stage1::{
+    AppState,
+    client::ReqwestClient,
+    create_app,
+    errors::{AppError, Result},
+};
+use tokio::net::TcpListener;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    initialize_tracing()?;
+    let reqwest_client = ReqwestClient::init()?;
+
+    let mongo_uri =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "mongodb://localhost:27017".into());
+
+    let mut client_options = ClientOptions::parse(&mongo_uri)
+        .await
+        .map_err(|e| AppError::ServiceUnavailable(format!("Failed to parse MongoDB URI: {}", e)))?;
+
+    let server_api = ServerApi::builder().version(ServerApiVersion::V1).build();
+    client_options.server_api = Some(server_api);
+
+    let mongo_client = mongodb::Client::with_options(client_options).map_err(|e| {
+        AppError::ServiceUnavailable(format!("Failed to initialize MongoDB client: {}", e))
+    })?;
+
+    mongo_client
+        .database("admin")
+        .run_command(doc! {"ping": 1})
+        .await
+        .map_err(|e| AppError::ServiceUnavailable(format!("Failed to ping MongoDB: {}", e)))?;
+
+    tracing::info!("Successfully connected to MongoDB Atlas");
+
+    let db = mongo_client.database("stage1");
+    let profile_repo = stage1::models::db::ProfileRepo::new(&db);
+
+    let state = AppState {
+        client: reqwest_client,
+        db: profile_repo,
+    };
+
+    let app = create_app(state);
+
+    let listener = TcpListener::bind("0.0.0.0:8000").await?;
+
+    tracing::info!("Server running on port 8000");
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn initialize_tracing() -> Result<()> {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,stage1=debug,tower_http=info".into());
+
+    Ok(tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_file(false)
+                .with_target(true)
+                .with_line_number(false)
+                .with_thread_ids(false)
+                .with_thread_names(false),
+        )
+        .try_init()?)
+}

@@ -1,0 +1,134 @@
+use crate::{
+    AppState,
+    errors::Result,
+    models::{
+        db::{Profile, ProfileFilters},
+        profile::{
+            CreateProfileRequest, ProfileListEntry, ProfileListResponse, ProfileQuery,
+            ProfileResponse,
+        },
+    },
+    utils::{fetch_age_data, fetch_country_data, fetch_gender_data, validate_name},
+};
+use axum::{
+    Json,
+    extract::{Path, Query, State, rejection::JsonRejection},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use uuid::Uuid;
+
+pub async fn create_profile(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<CreateProfileRequest>, JsonRejection>,
+) -> Result<impl IntoResponse> {
+    let Json(payload) =
+        payload.map_err(|e| crate::errors::AppError::InternalServerError(e.to_string()))?;
+    let name = validate_name(&payload.name)?;
+
+    if let Some(existing) = state.db.find_by_name(&name).await? {
+        return Ok((
+            StatusCode::OK,
+            Json(ProfileResponse {
+                status: "success".into(),
+                message: Some("Profile already exists".into()),
+                data: existing,
+            }),
+        )
+            .into_response());
+    }
+
+    let (gender_res, age_res, country_res) = tokio::try_join!(
+        fetch_gender_data(&state.client, &name),
+        fetch_age_data(&state.client, &name),
+        fetch_country_data(&state.client, &name)
+    )?;
+
+    let new_profile = Profile {
+        id: Uuid::now_v7().to_string(),
+        name: name.to_string(),
+        gender: gender_res.gender.unwrap_or_else(|| "unknown".to_string()),
+        gender_probability: (gender_res.gender_probability * 100.0).round() / 100.0,
+        sample_size: gender_res.sample_size,
+        age: age_res.age.unwrap_or(0),
+        age_group: format!("{:?}", age_res.age_group).to_lowercase(),
+        country_id: country_res.country_id,
+        country_probability: (country_res.country_probability * 100.0).round() / 100.0,
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+
+    state.db.insert_profile(new_profile.clone()).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ProfileResponse {
+            status: "success".into(),
+            message: None,
+            data: new_profile,
+        }),
+    )
+        .into_response())
+}
+
+pub async fn get_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse> {
+    let profile = state
+        .db
+        .find_by_id(&id)
+        .await?
+        .ok_or_else(|| crate::errors::AppError::NotFound("Profile not found".into()))?;
+
+    Ok(Json(ProfileResponse {
+        status: "success".into(),
+        message: None,
+        data: profile,
+    }))
+}
+
+pub async fn list_profiles(
+    State(state): State<AppState>,
+    Query(query): Query<ProfileQuery>,
+) -> Result<impl IntoResponse> {
+    let filters = ProfileFilters {
+        gender: query.gender,
+        country_id: query.country_id,
+        age_group: query.age_group,
+    };
+
+    let profiles = state.db.find_all(filters).await?;
+
+    let data: Vec<ProfileListEntry> = profiles
+        .into_iter()
+        .map(|profile| ProfileListEntry {
+            id: profile.id,
+            name: profile.name,
+            gender: profile.gender,
+            age: profile.age,
+            age_group: profile.age_group,
+            country_id: profile.country_id,
+        })
+        .collect();
+
+    Ok(Json(ProfileListResponse {
+        status: "success".into(),
+        count: data.len(),
+        data,
+    }))
+}
+
+pub async fn delete_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse> {
+    let deleted = state.db.delete_by_id(&id).await?;
+
+    if !deleted {
+        return Err(crate::errors::AppError::NotFound(
+            "Profile not found".into(),
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
